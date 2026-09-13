@@ -1,0 +1,796 @@
+#!/usr/bin/env bash
+# vclip — terminal video cutter/converter
+# Dependencies: ffmpeg, ffprobe, mpv, fzf, gum
+
+set -euo pipefail
+
+# ─── Paths ────────────────────────────────────────────────────────────────────
+VCLIP_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/vclip"
+VCLIP_OUTPUT_DIR="$HOME/Videos/vclip"
+HISTORY_FILE="$VCLIP_CONFIG/history"
+CONFIG_FILE="$VCLIP_CONFIG/config"
+PRESETS_DIR="$VCLIP_CONFIG/presets"
+MPV_MARKS_FILE="/tmp/vclip_marks"
+MPV_LUA_SCRIPT="$VCLIP_CONFIG/mpv/marks.lua"
+TRIM_RESULT_FILE="/tmp/vclip_trim_result"
+PRESET_MODE_FILE="/tmp/vclip_preset_mode"
+DEFAULT_SEARCH_DIR="$HOME/Videos"
+MAX_HISTORY=20
+
+VIDEO_EXTENSIONS=("mp4" "mkv" "mov" "webm" "avi" "m4v" "flv" "wmv")
+
+# ─── Session state ────────────────────────────────────────────────────────────
+S_SCALE=""
+S_FPS=""
+S_CODEC="libx264"
+S_CRF="22"
+S_PRESET_ENC="medium"
+S_AUDIO="copy"
+S_CROP=""
+S_TARGET_SIZE=""
+POST_SPEED=""
+POST_MUTE=false
+
+# ─── Setup ────────────────────────────────────────────────────────────────────
+mkdir -p "$VCLIP_CONFIG/mpv" "$PRESETS_DIR" "$VCLIP_OUTPUT_DIR"
+touch "$HISTORY_FILE"
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+die()     { gum style --foreground 9  "✗ $*"; exit 1; }
+info()    { gum style --foreground 12 "$*"; }
+success() { gum style --foreground 10 "✓ $*"; }
+warn()    { gum style --foreground 11 "⚠ $*"; }
+
+expand_path() { echo "${1/#\~/$HOME}"; }
+
+is_video_file() {
+    local ext="${1##*.}"; ext="${ext,,}"
+    for v in "${VIDEO_EXTENSIONS[@]}"; do [[ "$ext" == "$v" ]] && return 0; done
+    return 1
+}
+
+build_find_cmd() {
+    local dir="$1" first=true
+    local args=("find" "$dir" "-type" "f" "(")
+    for ext in "${VIDEO_EXTENSIONS[@]}"; do
+        $first && args+=("-iname" "*.${ext}") || args+=("-o" "-iname" "*.${ext}")
+        first=false
+    done
+    args+=(")")
+    "${args[@]}" 2>/dev/null
+}
+
+add_to_history() {
+    local file="$1"
+    local tmp; tmp=$(grep -vF "$file" "$HISTORY_FILE" 2>/dev/null || true)
+    { echo "$file"; echo "$tmp"; } | head -n "$MAX_HISTORY" > "${HISTORY_FILE}.tmp"
+    mv "${HISTORY_FILE}.tmp" "$HISTORY_FILE"
+}
+
+get_key() {
+    grep -m1 "^${2}=" "$1" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]' || true
+}
+
+ts_to_secs() {
+    local h m s; IFS=: read -r h m s <<< "$1"
+    echo $(( 10#$h * 3600 + 10#$m * 60 + 10#$s ))
+}
+
+# ─── Config / preset loading ──────────────────────────────────────────────────
+load_config() {
+    [[ ! -f "$CONFIG_FILE" ]] && return
+    local res fps codec crf enc audio
+    res=$(get_key   "$CONFIG_FILE" "resolution")
+    fps=$(get_key   "$CONFIG_FILE" "fps")
+    codec=$(get_key "$CONFIG_FILE" "codec")
+    crf=$(get_key   "$CONFIG_FILE" "crf")
+    enc=$(get_key   "$CONFIG_FILE" "enc_preset")
+    audio=$(get_key "$CONFIG_FILE" "audio")
+    [[ "$res" == "original" || -z "$res" ]] && S_SCALE="" || S_SCALE="scale=-2:${res}"
+    [[ "$fps" == "original" || -z "$fps" ]] && S_FPS=""   || S_FPS="fps=${fps}"
+    [[ -n "$codec" ]] && S_CODEC="$codec"
+    [[ -n "$crf"   ]] && S_CRF="$crf"
+    [[ -n "$enc"   ]] && S_PRESET_ENC="$enc"
+    [[ -n "$audio" ]] && S_AUDIO="$audio"
+}
+
+load_preset_file() {
+    local file="$1"
+    [[ ! -f "$file" ]] && die "Preset file not found: $file"
+    local res fps codec crf enc audio target
+    res=$(get_key    "$file" "resolution")
+    fps=$(get_key    "$file" "fps")
+    codec=$(get_key  "$file" "codec")
+    crf=$(get_key    "$file" "crf")
+    enc=$(get_key    "$file" "enc_preset")
+    audio=$(get_key  "$file" "audio")
+    target=$(get_key "$file" "target_size")
+    [[ "$res" == "original" || -z "$res" ]] && S_SCALE="" || S_SCALE="scale=-2:${res}"
+    [[ "$fps" == "original" || -z "$fps" ]] && S_FPS=""   || S_FPS="fps=${fps}"
+    [[ -n "$codec"  ]] && S_CODEC="$codec"
+    [[ -n "$crf"    ]] && S_CRF="$crf"
+    [[ -n "$enc"    ]] && S_PRESET_ENC="$enc"
+    [[ -n "$audio"  ]] && S_AUDIO="$audio"
+    [[ -n "$target" ]] && S_TARGET_SIZE="$target" || S_TARGET_SIZE=""
+}
+
+# ─── Video probe ──────────────────────────────────────────────────────────────
+PROBE_WIDTH="" PROBE_HEIGHT="" PROBE_FPS_RAW="" PROBE_DURATION_SECS=0
+
+probe_video() {
+    local file="$1"
+    local probe
+    probe=$(ffprobe -v quiet -print_format json -show_streams -show_format "$file" 2>/dev/null)
+    PROBE_WIDTH=$(echo   "$probe" | grep -m1 '"width"'        | grep -o '[0-9]*')
+    PROBE_HEIGHT=$(echo  "$probe" | grep -m1 '"height"'       | grep -o '[0-9]*')
+    PROBE_FPS_RAW=$(echo "$probe" | grep -m1 '"r_frame_rate"' | grep -o '"[0-9]*/[0-9]*"' | tr -d '"')
+    local dur
+    dur=$(echo "$probe" | grep '"duration"' | head -1 | grep -o '"[0-9.]*"' | tr -d '"')
+    PROBE_DURATION_SECS="${dur%.*}"
+    PROBE_DURATION_SECS="${PROBE_DURATION_SECS:-0}"
+}
+
+show_video_info() {
+    local file="$1"
+    local fps_disp dur_disp
+    if [[ "$PROBE_FPS_RAW" == *"/"* ]]; then
+        local n="${PROBE_FPS_RAW%/*}" d="${PROBE_FPS_RAW#*/}"
+        fps_disp=$(awk "BEGIN {printf \"%.2f\", $n/$d}")
+    else
+        fps_disp="$PROBE_FPS_RAW"
+    fi
+    dur_disp=$(printf "%02d:%02d:%02d" \
+        $((PROBE_DURATION_SECS/3600)) \
+        $((PROBE_DURATION_SECS%3600/60)) \
+        $((PROBE_DURATION_SECS%60)))
+    gum style \
+        --border rounded --border-foreground 12 --padding "0 1" --margin "1 0" \
+        "$(gum style --bold "File:")       $(basename "$file")
+$(gum style --bold "Resolution:")  ${PROBE_WIDTH}x${PROBE_HEIGHT}
+$(gum style --bold "FPS:")         $fps_disp
+$(gum style --bold "Duration:")    $dur_disp"
+}
+
+# ─── Input selection ──────────────────────────────────────────────────────────
+select_video() {
+    local choice
+    choice=$(gum choose --header "Select video source" --header.foreground 12 \
+        "Paste file path" "Paste directory" "Browse with fzf" "Recent videos")
+    case "$choice" in
+        "Paste file path") input_file_path ;;
+        "Paste directory") input_directory ;;
+        "Browse with fzf") browse_fzf "$DEFAULT_SEARCH_DIR" ;;
+        "Recent videos")   pick_recent ;;
+        *) die "No selection made." ;;
+    esac
+}
+
+input_file_path() {
+    local raw path
+    raw=$(gum input --placeholder "~/Videos/gameplay.mp4" --prompt "Video path: ")
+    [[ -z "$raw" ]] && die "No path entered."
+    path=$(expand_path "$raw")
+    [[ ! -f "$path" ]] && die "File not found: $path"
+    is_video_file "$path" || die "Not a recognised video file: $path"
+    echo "$path"
+}
+
+input_directory() {
+    local raw dir
+    raw=$(gum input --placeholder "~/Videos/clips/" --prompt "Directory: ")
+    [[ -z "$raw" ]] && die "No path entered."
+    dir=$(expand_path "$raw")
+    [[ ! -d "$dir" ]] && die "Directory not found: $dir"
+    build_find_cmd "$dir" \
+        | fzf --prompt "Select video > " --height 40% --border \
+        || die "No file selected."
+}
+
+browse_fzf() {
+    build_find_cmd "${1:-$DEFAULT_SEARCH_DIR}" \
+        | fzf --prompt "Select video > " --height 40% --border \
+        || die "No file selected."
+}
+
+pick_recent() {
+    [[ ! -s "$HISTORY_FILE" ]] && die "No recent videos found."
+    local result
+    result=$(grep -v '^$' "$HISTORY_FILE" \
+        | fzf --prompt "Recent > " --height 40% --border) || die "No file selected."
+    [[ ! -f "$result" ]] && die "File no longer exists: $result"
+    echo "$result"
+}
+
+# ─── Preset selection — direct call, sets globals ─────────────────────────────
+do_select_preset() {
+    declare -A preset_map
+    local -a ordered_labels=(
+        "Normal (720p, H264, crf22)"
+        "High Quality (original res, crf18)"
+        "Discord 480p (<10MB, two-pass)"
+        "Discord 720p (<10MB, two-pass)"
+        "Small File (480p, crf28)"
+    )
+    preset_map["Normal (720p, H264, crf22)"]="$PRESETS_DIR/normal.conf"
+    preset_map["High Quality (original res, crf18)"]="$PRESETS_DIR/high_quality.conf"
+    preset_map["Discord 480p (<10MB, two-pass)"]="$PRESETS_DIR/discord_480p.conf"
+    preset_map["Discord 720p (<10MB, two-pass)"]="$PRESETS_DIR/discord_720p.conf"
+    preset_map["Small File (480p, crf28)"]="$PRESETS_DIR/small_file.conf"
+
+    local builtin_names="normal high_quality discord_480p discord_720p small_file"
+    while IFS= read -r -d '' pfile; do
+        local pname; pname=$(basename "$pfile" .conf)
+        if ! echo "$builtin_names" | grep -qw "$pname"; then
+            local label="[custom] $pname"
+            ordered_labels+=("$label")
+            preset_map["$label"]="$pfile"
+        fi
+    done < <(find "$PRESETS_DIR" -name "*.conf" -print0 2>/dev/null | sort -z)
+
+    ordered_labels+=("Custom (manual settings)")
+
+    local choice
+    choice=$(printf '%s\n' "${ordered_labels[@]}" \
+        | gum choose --header "Encoding preset" --header.foreground 12)
+
+    if [[ "$choice" == "Custom (manual settings)" || -z "$choice" ]]; then
+        echo "custom" > "$PRESET_MODE_FILE"
+        return
+    fi
+
+    local pfile="${preset_map[$choice]:-}"
+    [[ -z "$pfile" ]] && die "Could not map choice to preset file."
+    load_preset_file "$pfile"
+    echo "preset" > "$PRESET_MODE_FILE"
+}
+
+# ─── Label helpers ────────────────────────────────────────────────────────────
+scale_label()   { [[ -z "$S_SCALE" ]] && echo "Original" || echo "${S_SCALE##*:}p"; }
+fps_label()     { [[ -z "$S_FPS"   ]] && echo "Original" || echo "${S_FPS#fps=} FPS"; }
+quality_label() { echo "crf ${S_CRF}, ${S_PRESET_ENC}"; }
+codec_label() {
+    case "$S_CODEC" in
+        libx264) echo "H.264" ;; libx265) echo "H.265" ;;
+        copy)    echo "Copy (no re-encode)" ;; *) echo "$S_CODEC" ;;
+    esac
+}
+audio_label() {
+    case "$S_AUDIO" in
+        copy) echo "Copy original" ;; aac_192k) echo "AAC 192k" ;;
+        aac_96k) echo "AAC 96k" ;;  mute) echo "Mute" ;; *) echo "$S_AUDIO" ;;
+    esac
+}
+
+# ─── Setting menus ────────────────────────────────────────────────────────────
+menu_resolution() {
+    local choice
+    choice=$(gum choose --header "Resolution  [current: $(scale_label)]" --header.foreground 12 \
+        "Keep original" "1080p" "720p" "480p" "360p")
+    case "$choice" in
+        "Keep original") S_SCALE="" ;; "1080p") S_SCALE="scale=-2:1080" ;;
+        "720p") S_SCALE="scale=-2:720" ;; "480p") S_SCALE="scale=-2:480" ;;
+        "360p") S_SCALE="scale=-2:360" ;;
+    esac
+}
+
+menu_fps() {
+    local choice
+    choice=$(gum choose --header "Frame rate  [current: $(fps_label)]" --header.foreground 12 \
+        "Keep original" "60 FPS" "30 FPS" "24 FPS")
+    case "$choice" in
+        "Keep original") S_FPS="" ;; "60 FPS") S_FPS="fps=60" ;;
+        "30 FPS") S_FPS="fps=30" ;; "24 FPS") S_FPS="fps=24" ;;
+    esac
+}
+
+menu_codec() {
+    local choice
+    choice=$(gum choose --header "Codec  [current: $(codec_label)]" --header.foreground 12 \
+        "H.264 (most compatible)" "H.265 (smaller files)" "Copy  (fast, no re-encode)")
+    case "$choice" in
+        "H.264"*) S_CODEC="libx264" ;; "H.265"*) S_CODEC="libx265" ;;
+        "Copy"*)  S_CODEC="copy" ;;
+    esac
+}
+
+menu_quality() {
+    local choice
+    choice=$(gum choose --header "Quality  [current: $(quality_label)]" --header.foreground 12 \
+        "High     (crf 18, slow)" "Balanced (crf 22, medium)" "Small    (crf 26, fast)")
+    case "$choice" in
+        "High"*) S_CRF=18; S_PRESET_ENC=slow ;;
+        "Balanced"*) S_CRF=22; S_PRESET_ENC=medium ;;
+        "Small"*) S_CRF=26; S_PRESET_ENC=fast ;;
+    esac
+}
+
+menu_audio() {
+    local choice
+    choice=$(gum choose --header "Audio  [current: $(audio_label)]" --header.foreground 12 \
+        "Copy original" "AAC 192k" "AAC 96k" "Mute (no audio)")
+    case "$choice" in
+        "Copy"*) S_AUDIO="copy" ;; "AAC 192k") S_AUDIO="aac_192k" ;;
+        "AAC 96k") S_AUDIO="aac_96k" ;; "Mute"*) S_AUDIO="mute" ;;
+    esac
+}
+
+menu_crop() {
+    local choice
+    choice=$(gum choose --header "Crop" --header.foreground 12 \
+        "No crop" "Center square" "Vertical 9:16" "Widescreen 16:9" "Custom crop")
+    local W="$PROBE_WIDTH" H="$PROBE_HEIGHT"
+    case "$choice" in
+        "No crop") S_CROP="" ;;
+        "Center square")  S_CROP="crop=${H}:${H}:$(( (W-H)/2 )):0" ;;
+        "Vertical 9:16")  local cw=$(( H*9/16 )); S_CROP="crop=${cw}:${H}:$(( (W-cw)/2 )):0" ;;
+        "Widescreen 16:9") local ch=$(( W*9/16 )); S_CROP="crop=${W}:${ch}:0:$(( (H-ch)/2 ))" ;;
+        "Custom crop")
+            local w h x y
+            w=$(gum input --placeholder "$W" --prompt "Width:  ")
+            h=$(gum input --placeholder "$H" --prompt "Height: ")
+            x=$(gum input --placeholder "0"  --prompt "X:      ")
+            y=$(gum input --placeholder "0"  --prompt "Y:      ")
+            [[ -z "$w" || -z "$h" || -z "$x" || -z "$y" ]] && die "All crop values required."
+            S_CROP="crop=${w}:${h}:${x}:${y}" ;;
+    esac
+}
+
+# Tweaks loop — uses gum choose so no stdin issues
+offer_tweaks() {
+    local choice
+    choice=$(gum choose --header "Tweak preset settings?" --header.foreground 12 \
+        "No, looks good" \
+        "Resolution  [$(scale_label)]" \
+        "Frame rate  [$(fps_label)]" \
+        "Codec       [$(codec_label)]" \
+        "Quality     [$(quality_label)]" \
+        "Audio       [$(audio_label)]" \
+        "Crop        [${S_CROP:-None}]")
+    [[ "$choice" == "No, looks good" || -z "$choice" ]] && return 0
+
+    # One setting changed — loop back to offer more
+    case "$choice" in
+        "Resolution"*) menu_resolution ;;
+        "Frame rate"*) menu_fps ;;
+        "Codec"*)      menu_codec ;;
+        "Quality"*)    menu_quality ;;
+        "Audio"*)      menu_audio ;;
+        "Crop"*)       menu_crop ;;
+    esac
+    offer_tweaks  # recurse until they pick "No, looks good"
+}
+
+custom_menus() {
+    menu_resolution; menu_fps; menu_codec
+    [[ "$S_CODEC" != "copy" ]] && menu_quality
+    menu_audio; menu_crop
+}
+
+# ─── Post options — all gum, no read, before mpv ─────────────────────────────
+ask_post_options() {
+    POST_SPEED=""
+    POST_MUTE=false
+
+    local speed_choice
+    speed_choice=$(gum choose --header "Apply speed change?" --header.foreground 12 \
+        "No" "1.25x" "1.5x" "1.75x" "2x" "Custom")
+    case "$speed_choice" in
+        "No"|"") ;;
+        "Custom")
+            local raw
+            raw=$(gum input --placeholder "1.5" --prompt "Speed multiplier (1.1–3.0): ")
+            if [[ -n "$raw" ]] && awk -v v="$raw" 'BEGIN{exit !(v+0==v && v>=1.1 && v<=3.0)}'; then
+                POST_SPEED="$raw"
+            else
+                warn "Invalid value — skipping speed change."
+            fi
+            ;;
+        *) POST_SPEED="${speed_choice%x}" ;;
+    esac
+
+    local mute_choice
+    mute_choice=$(gum choose --header "Mute audio in output?" --header.foreground 12 \
+        "No" "Yes")
+    [[ "$mute_choice" == "Yes" ]] && POST_MUTE=true
+}
+
+# ─── Trim — mpv opens AFTER all gum menus ────────────────────────────────────
+do_trim_with_mpv() {
+    local file="$1"
+    rm -f "$MPV_MARKS_FILE" "$TRIM_RESULT_FILE"
+
+    info "Opening mpv — F1=start  F2=end  F3=quit"
+
+    mpv --script="$MPV_LUA_SCRIPT" \
+        --script-opts="vclip-marks-file=$MPV_MARKS_FILE" \
+        --osd-level=3 --osd-duration=2000 \
+        "$file" 2>/dev/null || true
+
+    # Reopen stdin after mpv
+    exec </dev/tty
+
+    if [[ -f "$MPV_MARKS_FILE" ]]; then
+        local s e
+        s=$(grep "^START=" "$MPV_MARKS_FILE" | cut -d= -f2)
+        e=$(grep "^END="   "$MPV_MARKS_FILE" | cut -d= -f2)
+        if [[ -n "$s" && -n "$e" ]]; then
+            success "Marks: $s → $e"
+            echo "$s|$e" > "$TRIM_RESULT_FILE"
+            return
+        fi
+    fi
+    warn "No marks set — falling back to manual input."
+    do_trim_manual
+}
+
+do_trim_manual() {
+    local s e
+    s=$(gum input --placeholder "00:02:15" --prompt "Start time (HH:MM:SS): ")
+    e=$(gum input --placeholder "00:03:42" --prompt "End time   (HH:MM:SS): ")
+    [[ -z "$s" || -z "$e" ]] && die "Trim points required."
+    echo "$s|$e" > "$TRIM_RESULT_FILE"
+}
+
+# ─── ffmpeg helpers ───────────────────────────────────────────────────────────
+build_vf() {
+    local filters=()
+    [[ -n "$S_CROP"  ]] && filters+=("$S_CROP")
+    [[ -n "$S_SCALE" ]] && filters+=("$S_SCALE")
+    [[ -n "$S_FPS"   ]] && filters+=("$S_FPS")
+    local IFS=","
+    echo "${filters[*]}"
+}
+
+build_af_speed() {
+    local speed="$1"
+    local s; s=$(awk "BEGIN{printf \"%.4f\",$speed}")
+    if awk "BEGIN{exit !($s > 2.0)}"; then
+        local s2; s2=$(awk "BEGIN{printf \"%.4f\",$s/2.0}")
+        echo "atempo=2.0,atempo=${s2}"
+    else
+        echo "atempo=${s}"
+    fi
+}
+
+calc_video_bitrate() {
+    awk -v dur="$1" -v tmb="$2" -v abr="${3:-96}" '
+    BEGIN {
+        vbr = int(((tmb*8*1024*1024) - (abr*1000*dur)) / dur / 1000)
+        print (vbr < 100 ? 100 : vbr)
+    }'
+}
+
+suggest_output() {
+    local input="$1" tag="${2:-clip}"
+    local name; name=$(basename "$input"); name="${name%.*}"
+    tag=$(echo "$tag" | tr -d '()<> ' | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]/_/g')
+    echo "$VCLIP_OUTPUT_DIR/${name}_${tag}.mp4"
+}
+
+# ─── Summary ──────────────────────────────────────────────────────────────────
+show_summary() {
+    local input="$1" start="$2" end="$3" output="$4" vbr_info="${5:-}"
+    local extra=""
+    [[ -n "$POST_SPEED"     ]] && extra+="
+$(gum style --bold "Speed:")       ${POST_SPEED}x"
+    [[ "$POST_MUTE" == true ]] && extra+="
+$(gum style --bold "Mute:")        yes"
+    [[ -n "$vbr_info"       ]] && extra+="
+$(gum style --bold "Video bitrate:") ~${vbr_info}kbps (two-pass)"
+
+    gum style \
+        --border rounded --border-foreground 10 --padding "0 2" --margin "1 0" \
+        "$(gum style --bold "Input:")      $(basename "$input")
+$(gum style --bold "Trim:")       $start → $end
+$(gum style --bold "Resolution:") $(scale_label)
+$(gum style --bold "FPS:")        $(fps_label)
+$(gum style --bold "Codec:")      $(codec_label)
+$(gum style --bold "Quality:")    $(quality_label)
+$(gum style --bold "Audio:")      $(audio_label)
+$(gum style --bold "Crop:")       ${S_CROP:-None}${extra}
+$(gum style --bold "Output:")     $(basename "$output")"
+}
+
+# ─── Encode ───────────────────────────────────────────────────────────────────
+run_encode() {
+    local input="$1" start="$2" end="$3" output="$4"
+    mkdir -p "$(dirname "$output")"
+    local vf; vf=$(build_vf)
+    local passlog="/tmp/vclip_passlog"
+
+    if [[ -n "$S_TARGET_SIZE" ]]; then
+        local start_secs end_secs clip_secs
+        start_secs=$(ts_to_secs "$start")
+        end_secs=$(ts_to_secs "$end")
+        clip_secs=$(( end_secs - start_secs ))
+        [[ $clip_secs -le 0 ]] && die "End time must be after start time."
+
+        local audio_kbps=96
+        [[ "$S_AUDIO" == "aac_192k" ]] && audio_kbps=192
+
+        local vbr
+        vbr=$(calc_video_bitrate "$clip_secs" "$S_TARGET_SIZE" "$audio_kbps")
+        info "Two-pass — target ${S_TARGET_SIZE}MB, ~${vbr}kbps video"
+
+        local p1=(ffmpeg -y -ss "$start" -to "$end" -i "$input")
+        [[ -n "$vf" ]] && p1+=(-vf "$vf")
+        p1+=(-c:v "$S_CODEC" -b:v "${vbr}k" -pass 1 -passlogfile "$passlog" -an -f null /dev/null)
+
+        info "Pass 1/2..."
+        if ! "${p1[@]}" 2>/tmp/vclip_err; then
+            cat /tmp/vclip_err; die "Pass 1 failed."
+        fi
+
+        local p2=(ffmpeg -y -ss "$start" -to "$end" -i "$input")
+        [[ -n "$vf" ]] && p2+=(-vf "$vf")
+        p2+=(-c:v "$S_CODEC" -b:v "${vbr}k" -pass 2 -passlogfile "$passlog" \
+             -c:a aac -b:a "${audio_kbps}k" "$output")
+
+        info "Pass 2/2..."
+        if ! "${p2[@]}" 2>/tmp/vclip_err; then
+            cat /tmp/vclip_err; die "Pass 2 failed."
+        fi
+
+        rm -f "${passlog}"* /tmp/vclip_err
+
+    else
+        local cmd=(ffmpeg -y -ss "$start" -to "$end" -i "$input")
+        [[ -n "$vf" ]] && cmd+=(-vf "$vf")
+
+        if [[ "$S_CODEC" == "copy" ]]; then
+            cmd+=(-c copy)
+        else
+            cmd+=(-c:v "$S_CODEC" -crf "$S_CRF" -preset "$S_PRESET_ENC")
+            case "$S_AUDIO" in
+                copy)     cmd+=(-c:a copy) ;;
+                aac_192k) cmd+=(-c:a aac -b:a 192k) ;;
+                aac_96k)  cmd+=(-c:a aac -b:a 96k) ;;
+                mute)     cmd+=(-an) ;;
+                *)        cmd+=(-c:a copy) ;;
+            esac
+        fi
+        cmd+=("$output")
+
+        info "Encoding..."
+        if ! "${cmd[@]}" 2>/tmp/vclip_err; then
+            echo "--- ffmpeg error ---"
+            cat /tmp/vclip_err
+            echo "--------------------"
+            die "Encoding failed."
+        fi
+        rm -f /tmp/vclip_err
+    fi
+
+    if [[ ! -f "$output" ]]; then
+        die "ffmpeg did not produce output."
+    fi
+}
+
+# ─── Post-processing (speed / mute) ──────────────────────────────────────────
+# Speed is applied here as a separate pass AFTER the main encode.
+# Mute-only is also handled here if POST_MUTE=true (even if S_AUDIO=mute,
+# the file already has no audio, so we just do a speed pass with -an).
+apply_post() {
+    local clip="$1"
+
+    # Nothing to do
+    if [[ -z "$POST_SPEED" && "$POST_MUTE" == false ]]; then
+        return 0
+    fi
+
+    # Speed-only or speed+mute
+    if [[ -n "$POST_SPEED" ]]; then
+        local tmp="${clip%.mp4}_spd_tmp.mp4"
+        local vf_s; vf_s="setpts=$(awk "BEGIN{printf \"%.6f\",1/$POST_SPEED}")*PTS"
+
+        # Check if input has an audio stream
+        local has_audio
+        has_audio=$(ffprobe -v quiet -select_streams a -show_entries stream=codec_type \
+            -of csv=p=0 "$clip" 2>/dev/null | head -1)
+
+        local cmd=(ffmpeg -y -i "$clip" -vf "$vf_s" -c:v libx264)
+
+        if [[ -n "$has_audio" && "$POST_MUTE" == false ]]; then
+            # Has audio and user didn't mute — speed the audio too
+            local af; af=$(build_af_speed "$POST_SPEED")
+            cmd+=(-c:a aac -b:a 192k -af "$af")
+        else
+            # No audio stream, or user wants mute — drop audio
+            cmd+=(-an)
+        fi
+
+        cmd+=("$tmp")
+        info "Applying speed (${POST_SPEED}x)..."
+        if ! "${cmd[@]}" 2>/tmp/vclip_err; then
+            echo "--- ffmpeg error ---"
+            cat /tmp/vclip_err
+            echo "--------------------"
+            die "Speed post-processing failed."
+        fi
+        rm -f /tmp/vclip_err
+        mv "$tmp" "$clip"
+        success "Speed applied (${POST_SPEED}x)"
+        return 0
+    fi
+
+    # Mute-only (no speed) — stream-copy video, drop audio
+    if [[ "$POST_MUTE" == true ]]; then
+        local has_audio
+        has_audio=$(ffprobe -v quiet -select_streams a -show_entries stream=codec_type \
+            -of csv=p=0 "$clip" 2>/dev/null | head -1)
+
+        if [[ -z "$has_audio" ]]; then
+            info "Audio already absent — skipping mute step."
+            return 0
+        fi
+
+        local tmp="${clip%.mp4}_mute_tmp.mp4"
+        local cmd=(ffmpeg -y -i "$clip" -c:v copy -an "$tmp")
+        info "Muting audio..."
+        if ! "${cmd[@]}" 2>/tmp/vclip_err; then
+            echo "--- ffmpeg error ---"
+            cat /tmp/vclip_err
+            echo "--------------------"
+            die "Mute post-processing failed."
+        fi
+        rm -f /tmp/vclip_err
+        mv "$tmp" "$clip"
+        success "Audio muted."
+    fi
+}
+
+# ─── Delete original ──────────────────────────────────────────────────────────
+maybe_delete_original() {
+    local original="$1"
+    local fname; fname=$(basename "$original")
+
+    local choice
+    choice=$(gum choose \
+        --header "Delete original file? ($fname)" \
+        --header.foreground 11 \
+        "No, keep it" "Yes, delete it")
+    [[ "$choice" != "Yes, delete it" ]] && return 0
+
+    choice=$(gum choose \
+        --header "Are you sure? This cannot be undone." \
+        --header.foreground 9 \
+        "Cancel" "Yes, permanently delete")
+    [[ "$choice" != "Yes, permanently delete" ]] && return 0
+
+    rm -f "$original"
+    success "Deleted: $original"
+}
+
+# ─── Custom preset creator ────────────────────────────────────────────────────
+create_custom_preset() {
+    info "── Create custom preset ──"
+    local pname
+    pname=$(gum input --placeholder "my_preset" --prompt "Preset name: ")
+    [[ -z "$pname" ]] && die "No name given."
+    pname="${pname// /_}"
+    menu_resolution; menu_fps; menu_codec
+    [[ "$S_CODEC" != "copy" ]] && menu_quality
+    menu_audio
+    local res_val fps_val
+    [[ -z "$S_SCALE" ]] && res_val="original" || res_val="${S_SCALE##*:}"
+    [[ -z "$S_FPS"   ]] && fps_val="original" || fps_val="${S_FPS#fps=}"
+    cat > "$PRESETS_DIR/${pname}.conf" << EOF
+# Custom preset: $pname
+resolution=$res_val
+fps=$fps_val
+codec=$S_CODEC
+crf=$S_CRF
+enc_preset=$S_PRESET_ENC
+audio=$S_AUDIO
+EOF
+    success "Saved → $PRESETS_DIR/${pname}.conf"
+}
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+main() {
+    gum style \
+        --border double --border-foreground 12 \
+        --align center --padding "0 4" --margin "1 0" \
+        "$(gum style --bold --foreground 12 "v")$(gum style --bold "clip")"
+
+    if [[ "${1:-}" == "--create-preset" ]]; then
+        load_config; create_custom_preset; exit 0
+    fi
+
+    load_config
+
+    # ── 1. Select video ──
+    local video_file
+    if [[ $# -gt 0 && "${1:-}" != "--"* ]]; then
+        local arg; arg=$(expand_path "$1")
+        if   [[ -d "$arg" ]]; then video_file=$(browse_fzf "$arg")
+        elif [[ -f "$arg" ]]; then
+            is_video_file "$arg" || die "Not a recognised video file: $arg"
+            video_file="$arg"
+        else die "Path not found: $arg"; fi
+    else
+        video_file=$(select_video)
+    fi
+    [[ -z "$video_file" ]] && die "No video selected."
+    add_to_history "$video_file"
+    probe_video "$video_file"
+    show_video_info "$video_file"
+
+    # ── 2. Preset ──
+    rm -f "$PRESET_MODE_FILE"
+    do_select_preset
+    local preset_mode; preset_mode=$(cat "$PRESET_MODE_FILE")
+
+    if [[ "$preset_mode" == "custom" ]]; then
+        custom_menus
+    else
+        gum style --foreground 12 \
+"Preset loaded:
+  Resolution: $(scale_label)   FPS: $(fps_label)
+  Codec: $(codec_label)   Quality: $(quality_label)
+  Audio: $(audio_label)"
+        offer_tweaks
+    fi
+
+    # ── 3. Trim method (pick before mpv, actual trim happens after) ──
+    local trim_method
+    trim_method=$(gum choose --header "Trim method" --header.foreground 12 \
+        "Use F1/F2 keys in mpv" \
+        "Type timestamps manually")
+
+    # ── 4. Post options (all gum, before mpv opens) ──
+    ask_post_options
+
+    # ── 5. Output path (before mpv) ──
+    local suggested; suggested=$(suggest_output "$video_file" "$preset_mode")
+    local output_path
+    output_path=$(gum input --value "$suggested" --prompt "Output file: ")
+    [[ -z "$output_path" ]] && die "No output path given."
+    output_path=$(expand_path "$output_path")
+
+    # ── 6. NOW open mpv / manual timestamps ──
+    rm -f "$TRIM_RESULT_FILE"
+    case "$trim_method" in
+        "Use F1/F2"*) do_trim_with_mpv "$video_file" ;;
+        *)            do_trim_manual ;;
+    esac
+    [[ ! -f "$TRIM_RESULT_FILE" ]] && die "No trim points saved."
+    local trim_result start_time end_time
+    trim_result=$(cat "$TRIM_RESULT_FILE")
+    start_time="${trim_result%%|*}"
+    end_time="${trim_result##*|}"
+
+    # ── 7. Summary ──
+    local vbr_preview=""
+    if [[ -n "$S_TARGET_SIZE" ]]; then
+        local s_secs e_secs c_secs
+        s_secs=$(ts_to_secs "$start_time")
+        e_secs=$(ts_to_secs "$end_time")
+        c_secs=$(( e_secs - s_secs ))
+        vbr_preview=$(calc_video_bitrate "$c_secs" "$S_TARGET_SIZE" 96)
+    fi
+    show_summary "$video_file" "$start_time" "$end_time" "$output_path" "$vbr_preview"
+
+    # ── 8. Confirm — gum choose, not read, stdin is clean ──
+    local go
+    go=$(gum choose --header "Start conversion?" --header.foreground 12 \
+        "Yes, encode now" "Cancel")
+    [[ "$go" != "Yes, encode now" ]] && { info "Cancelled."; exit 0; }
+
+    # ── 9. Encode ──
+    run_encode "$video_file" "$start_time" "$end_time" "$output_path"
+
+    # ── 10. Post-processing ──
+    apply_post "$output_path"
+
+    # ── 11. Done ──
+    if [[ ! -f "$output_path" ]]; then
+        die "Output file missing after encode."
+    fi
+    success "Saved → $output_path"
+
+    # ── 12. Delete original? ──
+    maybe_delete_original "$video_file"
+}
+
+main "$@"
