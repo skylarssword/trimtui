@@ -36,6 +36,15 @@ PRESET_MODE=""
 TRIM_START=""
 TRIM_END=""
 
+# ─── Flag-mode state (set by parse_flags) ─────────────────────────────────────
+FLAG_PRESET=""       # preset filename stem, e.g. discord_720p
+FLAG_PRESET_TAG=""   # output filename tag, e.g. discord
+FLAG_MUTE=false
+FLAG_SPEED=""
+FLAG_TS_START=""
+FLAG_TS_END=""
+POSITIONAL=""        # video file or directory, if given
+
 # ─── Run-scoped temp dir ──────────────────────────────────────────────────────
 RUN_TMP=""
 cleanup() {
@@ -999,6 +1008,35 @@ create_custom_preset() {
     success "Saved → $dest"
 }
 
+# ─── Flag parsing ─────────────────────────────────────────────────────────────
+parse_flags() {
+    while (($#)); do
+        case "$1" in
+            -d480) FLAG_PRESET="discord_480p"; FLAG_PRESET_TAG="discord"; shift ;;
+            -d720) FLAG_PRESET="discord_720p"; FLAG_PRESET_TAG="discord"; shift ;;
+            -n)    FLAG_PRESET="normal";       FLAG_PRESET_TAG="normal";  shift ;;
+            -q)    FLAG_PRESET="high_quality"; FLAG_PRESET_TAG="quality"; shift ;;
+            -s)    FLAG_PRESET="small_file";   FLAG_PRESET_TAG="small";   shift ;;
+            -m)    FLAG_MUTE=true; shift ;;
+            -x*)
+                FLAG_SPEED="${1#-x}"
+                [[ -z "$FLAG_SPEED" ]] && die "Usage: -x<speed>, e.g. -x1.5"
+                awk -v v="$FLAG_SPEED" 'BEGIN{exit !(v+0==v && v>=1.1 && v<=3.0)}' 2>/dev/null \
+                    || die "Invalid speed: $FLAG_SPEED (must be 1.1-3.0)"
+                shift ;;
+            -t)
+                (($# >= 3)) || die "-t requires two timestamps: -t <start> <end>"
+                FLAG_TS_START="$2"; FLAG_TS_END="$3"; shift 3 ;;
+            -h|--help)    usage; exit 0 ;;
+            -v|--version) printf '%s %s\n' "$APP_NAME" "$APP_VERSION"; exit 0 ;;
+            --create-preset) POSITIONAL="--create-preset"; shift ;;
+            --) shift; [[ $# -gt 0 ]] && { POSITIONAL="$1"; shift; } ;;
+            -*) die "Unknown flag: $1 (see --help)" ;;
+            *)  POSITIONAL="$1"; shift ;;
+        esac
+    done
+}
+
 usage() {
     cat <<EOF
 $APP_NAME $APP_VERSION — terminal video cutter/converter
@@ -1011,6 +1049,25 @@ Usage:
   $APP_NAME --version        Print version
   $APP_NAME --help           Show this help
 
+Flag mode (skips every menu except crop and trim marking):
+  -d480          Discord 480p preset (<10MB, two-pass)
+  -d720          Discord 720p preset (<10MB, two-pass)
+  -n             Normal preset (720p, H264, crf22)
+  -q             High Quality preset (original res, crf18)
+  -s             Small File preset (480p, crf28)
+  -m             Mute the output audio
+  -x<speed>      Apply a speed change, e.g. -x1.5, -x2
+  -t <start> <end>   Trim points, e.g. -t 1:30 2:45 (skips mpv)
+
+  No file given -> opens the interactive video picker first.
+  No -t given   -> opens mpv for F1/F2 marking.
+  Output is named <clip>_<preset>.mp4, e.g. clip_discord.mp4
+
+  Examples:
+    $APP_NAME -d720 clip.mp4
+    $APP_NAME -d480 -m -t 1:30 2:45 clip.mp4
+    $APP_NAME -n -x1.5
+
 Config:  $TRIMTUI_CONFIG/config
 Presets: $PRESETS_DIR
 Output:  $TRIMTUI_OUTPUT_DIR
@@ -1019,10 +1076,7 @@ EOF
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 main() {
-    case "${1:-}" in
-        -h|--help)    usage; exit 0 ;;
-        -v|--version) printf '%s %s\n' "$APP_NAME" "$APP_VERSION"; exit 0 ;;
-    esac
+    parse_flags "$@"
 
     check_deps
     have gum || { printf 'trimtui: missing required dependency: gum\n' >&2; exit 1; }
@@ -1036,7 +1090,7 @@ main() {
         --align center --padding "0 4" --margin "1 0" \
         "$(gum style --bold --foreground 12 "trim")$(gum style --bold "tui")" >&2
 
-    if [[ "${1:-}" == "--create-preset" ]]; then
+    if [[ "$POSITIONAL" == "--create-preset" ]]; then
         load_config
         create_custom_preset
         exit 0
@@ -1046,8 +1100,8 @@ main() {
 
     # ── 1. Select video ──
     local video_file
-    if [[ $# -gt 0 && "${1:-}" != "--"* ]]; then
-        local arg; arg=$(expand_path "$1")
+    if [[ -n "$POSITIONAL" ]]; then
+        local arg; arg=$(expand_path "$POSITIONAL")
         if   [[ -d "$arg" ]]; then video_file=$(browse_fzf "$arg")
         elif [[ -f "$arg" ]]; then
             is_video_file "$arg" || die "Not a recognised video file: $arg"
@@ -1062,7 +1116,43 @@ main() {
     add_to_history "$video_file"
     show_video_info "$video_file"
 
-    # ── 2. Preset ──
+    # ── FLAG MODE: preset + post-options already known, skip every menu ──
+    if [[ -n "$FLAG_PRESET" ]]; then
+        load_preset_file "$PRESETS_DIR/${FLAG_PRESET}.conf"
+        PRESET_MODE="preset"
+        POST_SPEED="$FLAG_SPEED"
+        POST_MUTE="$FLAG_MUTE"
+
+        if [[ -n "$FLAG_TS_START" && -n "$FLAG_TS_END" ]]; then
+            set_trim_points "$FLAG_TS_START" "$FLAG_TS_END" \
+                || die "Invalid trim range: $FLAG_TS_START -> $FLAG_TS_END (check order and format)"
+        else
+            do_trim_with_mpv "$video_file"
+        fi
+        [[ -n "$TRIM_START" && -n "$TRIM_END" ]] || die "No trim points saved."
+
+        local output_path; output_path=$(suggest_output "$video_file" "$FLAG_PRESET_TAG")
+        if [[ -e "$output_path" ]]; then
+            local ow
+            ow=$(choose_one "Output exists. Overwrite? ($(basename "$output_path"))" "No" "Yes") \
+                || die "Cancelled."
+            [[ "$ow" != "Yes" ]] && die "Cancelled — output file left alone."
+        fi
+
+        info "Encoding → $(basename "$output_path")"
+        run_encode "$video_file" "$output_path"
+        apply_post "$output_path"
+        [[ -s "$output_path" ]] || die "Output file missing after encode."
+
+        local final_size; final_size=$(du -h "$output_path" 2>/dev/null | cut -f1 || echo "?")
+        success "Saved → $output_path ($final_size)"
+
+        maybe_delete_original "$video_file"
+        maybe_copy_to_clipboard "$output_path"
+        exit 0
+    fi
+
+    # ── 2. Preset (interactive) ──
     do_select_preset
     if [[ "$PRESET_MODE" == "custom" ]]; then
         custom_menus
