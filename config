@@ -1,6 +1,6 @@
-# vclip default settings
+# trimtui default settings
 # These values pre-fill the menus when using Custom mode.
-# Edit freely — vclip reads this on every launch.
+# Edit freely — trimtui reads this on every launch.
 
 resolution=original
 fps=original
