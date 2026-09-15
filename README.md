@@ -52,4 +52,8 @@ target_size=9.5       # optional - switches to two-pass bitrate targeting
 
 Drop your own `.conf` in that directory and it shows up in the preset menu.
 
+The included `discord_480p` and `discord_720p` presets target under 10MB via
+two-pass encoding — ready to attach in Discord without hitting the file size
+limit.
+
 *ai disclaimer: this project was assisted by claude*
