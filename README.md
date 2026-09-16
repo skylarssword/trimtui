@@ -1,7 +1,11 @@
-# trimtui - a simple tui video clipper
+# trimtui - a simple tui video clipper (WIP)
 
 Trim, crop, rescale and compress video from the terminal. Mark in/out points
 live in mpv with F1/F2, pick an encoding preset, and let ffmpeg do the rest.
+
+Trimtui in the terminal:
+<img width="834" height="413" alt="trimtui" src="https://github.com/user-attachments/assets/49f2a2db-ea9f-4c3e-aef9-a09bd067cb3d" />
+
 
 ## Dependencies
 
