@@ -947,7 +947,35 @@ maybe_copy_to_clipboard() {
     return 0
 }
 
-# ─── Delete original ──────────────────────────────────────────────────────────
+# ─── Update check ─────────────────────────────────────────────────────────────
+UPDATE_CHECK_FILE="$TRIMTUI_CONFIG/last_update_check"
+UPDATE_CHECK_INTERVAL=$(( 7 * 24 * 60 * 60 ))
+
+maybe_check_updates() {
+    local now; now=$(date +%s)
+    local last=0
+    [[ -f "$UPDATE_CHECK_FILE" ]] && last=$(cat "$UPDATE_CHECK_FILE" 2>/dev/null || echo 0)
+    local elapsed=$(( now - last ))
+    (( elapsed < UPDATE_CHECK_INTERVAL )) && return 0
+
+    local choice
+    choice=$(choose_one "Check for updates?" "No" "Yes") || return 0
+    printf '%s' "$now" > "$UPDATE_CHECK_FILE"
+    [[ "$choice" != "Yes" ]] && return 0
+
+    local remote_version
+    remote_version=$(curl -sf --max-time 5 \
+        "https://raw.githubusercontent.com/skylarssword/trimtui/main/trimtui" \
+        | grep -m1 "^APP_VERSION=" | cut -d= -f2 | tr -d '"' || true)
+
+    if [[ -z "$remote_version" ]]; then
+        warn "Could not reach GitHub — no internet?"
+    elif [[ "$remote_version" == "$APP_VERSION" ]]; then
+        success "trimtui is up to date ($APP_VERSION)"
+    else
+        warn "trimtui $remote_version available (you have $APP_VERSION) — run ./install.sh to update"
+    fi
+}
 maybe_delete_original() {
     local original="$1"
     local fname; fname=$(basename "$original")
@@ -1150,6 +1178,7 @@ main() {
 
         maybe_delete_original "$video_file"
         maybe_copy_to_clipboard "$output_path"
+        maybe_check_updates
         exit 0
     fi
 
@@ -1232,6 +1261,9 @@ main() {
 
     # ── 13. Copy to clipboard? ──
     maybe_copy_to_clipboard "$output_path"
+
+    # ── 14. Update check (once a week) ──
+    maybe_check_updates
 }
 
 main "$@"
