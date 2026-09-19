@@ -663,6 +663,7 @@ set_trim_points() {
 }
 
 do_trim_manual() {
+    [[ -e /dev/tty ]] && exec </dev/tty || true
     local s e
     while true; do
         s=$(ask_text "Start time (HH:MM:SS): " "00:02:15") || die "Cancelled."
